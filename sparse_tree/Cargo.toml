@@ -1,0 +1,25 @@
+[package]
+name = "sparse_tree"
+version = "0.1.0"
+edition = "2021"
+
+
+[dependencies]
+risc0-zkvm = { version = "3.0.0-rc.1", default-features = false, features = [
+    'std',
+] }
+num-bigint = { version = "0.4.6", features = ["serde"] }
+serde = { version = "1.0.219", features = ["derive"] }
+risc0-zkvm-platform = "2.0.3-rc.1"
+halo2_proofs = "0.3.0"
+halo2_gadgets = "0.3.1"
+rand_core = "0.6.4"
+anyhow = "1.0.98"
+halo2_poseidon = { version = "0.1.0", features = ["test-dependencies"] }
+ff = "0.13.1"
+pasta_curves = "0.5.1"
+ark-std = "0.5.0"
+rand = "0.8.5"
+
+[patch.crates-io]
+crypto-bigint = { git = "https://github.com/risc0/RustCrypto-crypto-bigint", tag = "v0.5.5-risczero.0" }
