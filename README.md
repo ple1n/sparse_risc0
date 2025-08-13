@@ -1,3 +1,4 @@
-An attempt at running sparse tree over halo2 directly inside risc0
 
-which turned out to be very slow. repo uploaded for further use
+# Freenet on ZK 
+
+Example [freenet](https://github.com/freenet/freenet-core/) contract with [RISC0](https://github.com/risc0/risc0)
