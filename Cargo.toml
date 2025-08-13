@@ -7,5 +7,9 @@ members = ["host", "methods", "sparse_tree"]
 opt-level = 3
 
 [profile.release]
-debug = 1
+debug = 0
 lto = true
+opt-level = "s"
+
+[workspace.dependencies]
+rand = { version = "0.8" }

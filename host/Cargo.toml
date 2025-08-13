@@ -5,8 +5,16 @@ edition = "2021"
 
 [dependencies]
 methods = { path = "../methods" }
-risc0-zkvm = { version = "3.0.0-rc.1" }
+risc0-zkvm = { version = "3.0.0-rc.1", default-features = false, features = [
+    "client",
+] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 serde = "1.0"
 tracing = "0.1.41"
 sparse_tree = { version = "0.1.0", path = "../sparse_tree" }
+sha2 = "=0.10.8"
+# getrandom = { version = "*", default-features = false, features = ["js"] }
+# halo2_proofs = { version = "0.3", default-features = false }
+
+[profile.release]
+opt-level = "s"

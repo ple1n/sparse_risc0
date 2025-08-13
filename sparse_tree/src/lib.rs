@@ -1,7 +1,3 @@
-pub mod smt;
-pub mod poseidon;
+#![allow(clippy::all)]
 
-pub use halo2_proofs;
-pub use halo2_gadgets;
-pub use halo2_poseidon;
-pub use ff;
+pub mod smt;

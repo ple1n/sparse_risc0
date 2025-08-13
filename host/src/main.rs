@@ -4,33 +4,27 @@ use std::error::Error;
 // The ELF is used for proving and the ID is used for verification.
 use methods::{SPARSE_PROVER_ELF, SPARSE_PROVER_ID};
 use risc0_zkvm::{default_prover, ExecutorEnv, Receipt};
+use sha2::{Digest, Sha256};
 use tracing::info;
 
+use sparse_tree::smt::SparseMerkleTree;
+
 fn main() -> Result<(), Box<dyn Error>> {
-    // Initialize tracing. In order to view logs, run `RUST_LOG=info cargo run`
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::filter::EnvFilter::from_default_env())
         .init();
-    
-    // An executor environment describes the configurations for the zkVM
-    // including program inputs.
-    // A default ExecutorEnv can be created like so:
-    // `let env = ExecutorEnv::builder().build().unwrap();`
-    // However, this `env` does not have any inputs.
-    //
-    // To add guest input to the executor environment, use
-    // ExecutorEnvBuilder::write().
-    // To access this method, you'll need to use ExecutorEnv::builder(), which
-    // creates an ExecutorEnvBuilder. When you're done adding input, call
-    // ExecutorEnvBuilder::build().
 
-    // For example:
-    // let mut tree = SMT::new(true);
-    // tree.add(n32(2), n32(3))?;
-    // let proof = tree.create_proof(n32(3));
-
-    let env = ExecutorEnv::builder().write(&32u64).unwrap().build()?;
-
+    let mut leaves = vec![];
+    for n in 0..10 {
+        let mut s = [0; 32];
+        s[0] = n;
+        leaves.push(s);
+    }
+    let h = Sha256::new();
+    let tree: SparseMerkleTree<[u8; 32], Sha256, 32> =
+        SparseMerkleTree::new_sequential(&leaves, &h, [0; 32]).unwrap();
+    let pt = tree.batch_prove(&[0, 2, 10]);
+    let env = ExecutorEnv::builder().write(&pt).unwrap().build()?;
     let prover = default_prover();
 
     // Proof information by proving the specified ELF binary.
@@ -40,11 +34,11 @@ fn main() -> Result<(), Box<dyn Error>> {
     // extract the receipt.
     let mut receipt = prove_info.receipt;
     info!("{:?}", receipt);
-    
+
     // For example:
     let output: () = receipt.journal.decode()?;
     // info!("{}", output);
-    
+
     // The receipt was verified at the end of proving, but the below code is an
     // example of how someone else could verify this receipt.
     receipt.verify(SPARSE_PROVER_ID).unwrap();

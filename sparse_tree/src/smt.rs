@@ -35,16 +35,20 @@
 //! the nodes. Then the merkle proof path `e-b-a` from leaf `e` to root `a` is
 //! stored as `[(d,e), (b,c)]`
 
-use anyhow::{Error, Result};
-use ff::FromUniformBytes;
-use halo2_proofs::arithmetic::Field as FieldExt;
+#![allow(clippy::clone_on_copy)]
+
+use anyhow::{bail, Error, Result};
+use ark_std::Zero;
+use digest::{consts::U256, Digest};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::{
     borrow::ToOwned,
     collections::{BTreeMap, BTreeSet},
+    fmt::Debug,
+    io::Read,
     marker::PhantomData,
+    ops::{Add, AddAssign},
 };
-
-use crate::poseidon::FieldHasher;
 
 /// Error enum for Sparse Merkle Tree.
 #[derive(Debug)]
@@ -67,69 +71,72 @@ impl core::fmt::Display for MerkleError {
 
 impl std::error::Error for MerkleError {}
 
+pub trait FieldExt: Clone + Eq + Copy + ToOwned<Owned = Self> + Serialize + Default {}
+pub trait FieldHasher<F, const W: usize> {
+    fn hash(&self, nodes: [F; W]) -> Result<F>;
+}
+
 /// The Path struct.
 ///
 /// The path contains a sequence of sibling nodes that make up a merkle proof.
 /// Each pair is used to identify whether an incremental merkle root
 /// construction is valid at each intermediate step.
-#[derive(Clone)]
-pub struct Path<F: FieldExt, H: FieldHasher<F, 2>, const N: usize> {
+#[derive(Clone, Serialize, Deserialize, Debug)]
+pub struct Path<F: FieldExt, const N: usize> {
     /// The path represented as a sequence of sibling pairs.
-    pub path: [(F, F); N],
-    /// The phantom hasher type used to reconstruct the merkle root.
-    pub marker: PhantomData<H>,
+    pub path: heapless::Vec<(F, F), N>,
 }
 
-impl<F: FieldExt, H: FieldHasher<F, 2>, const N: usize> Path<F, H, N> {
+#[derive(Clone, Serialize, Deserialize, Debug)]
+pub struct Proof<F: FieldExt, const N: usize> {
+    pub path: Path<F, N>,
+    pub root: F,
+    pub leaf: F,
+}
+
+impl<F: FieldExt + Serialize + DeserializeOwned, const N: usize> Proof<F, N>
+where
+    [(F, F); N]: DeserializeOwned + Serialize,
+{
+    pub fn verify<H: FieldHasher<F, 2>>(&self, h: &H) -> Result<bool> {
+        self.path.check_membership(&self.root, &self.leaf, h)
+    }
+}
+
+impl<F: FieldExt + Serialize + DeserializeOwned, const N: usize> Path<F, N>
+where
+    [(F, F); N]: DeserializeOwned + Serialize,
+{
     /// Takes in an expected `root_hash` and leaf-level data (i.e. hashes of
     /// secrets) for a leaf and checks that the leaf belongs to a tree having
     /// the expected hash.
-    pub fn check_membership(&self, root_hash: &F, leaf: &F, hasher: &H) -> Result<bool, Error> {
+    pub fn check_membership<H: FieldHasher<F, 2>>(
+        &self,
+        root_hash: &F,
+        leaf: &F,
+        hasher: &H,
+    ) -> Result<bool, Error> {
         let root = self.calculate_root(leaf, hasher)?;
         Ok(root == *root_hash)
     }
 
     /// Assumes leaf contains leaf-level data, i.e. hashes of secrets
     /// stored on leaf-level.
-    pub fn calculate_root(&self, leaf: &F, hasher: &H) -> Result<F, Error> {
+    pub fn calculate_root<H: FieldHasher<F, 2>>(&self, leaf: &F, hasher: &H) -> Result<F, Error> {
         if *leaf != self.path[0].0 && *leaf != self.path[0].1 {
             return Err(MerkleError::InvalidLeaf.into());
         }
 
-        let mut prev = *leaf;
+        let mut prev = leaf.clone();
         // Check levels between leaf level and root
         for &(ref left_hash, ref right_hash) in &self.path {
             if &prev != left_hash && &prev != right_hash {
                 return Err(MerkleError::InvalidPathNodes.into());
             }
-            prev = hasher.hash([*left_hash, *right_hash])?;
+            prev = hasher.hash([left_hash.clone(), right_hash.clone()])?;
         }
 
         Ok(prev)
-    }
-
-    /// Given leaf data determine what the index of this leaf must be
-    /// in the Merkle tree it belongs to.  Before doing so check that the leaf
-    /// does indeed belong to a tree with the given `root_hash`
-    pub fn get_index(&self, root_hash: &F, leaf: &F, hasher: &H) -> Result<F, Error> {
-        if !self.check_membership(root_hash, leaf, hasher)? {
-            return Err(MerkleError::InvalidLeaf.into());
-        }
-
-        let mut prev = *leaf;
-        let mut index = F::ZERO;
-        let mut twopower = F::ONE;
-        // Check levels between leaf level and root
-        for &(ref left_hash, ref right_hash) in &self.path {
-            // Check if the previous hash is for a left node or right node
-            if &prev != left_hash {
-                index += twopower;
-            }
-            twopower = twopower + twopower;
-            prev = hasher.hash([*left_hash, *right_hash])?;
-        }
-
-        Ok(index)
     }
 }
 
@@ -142,35 +149,38 @@ pub struct SparseMerkleTree<F: FieldExt, H: FieldHasher<F, 2>, const N: usize> {
     /// A map from leaf indices to leaf data stored as field elements.
     pub tree: BTreeMap<u64, F>,
     /// An array of default hashes hashed with themselves `N` times.
-    empty_hashes: [F; N],
+    empty_hashes: heapless::Vec<F, N>,
     /// The phantom hasher type used to build the merkle tree.
     marker: PhantomData<H>,
 }
 
-impl<F: FieldExt + FromUniformBytes<64>, H: FieldHasher<F, 2>, const N: usize>
-    SparseMerkleTree<F, H, N>
-{
+impl<F: FieldExt, H: FieldHasher<F, 2>, const N: usize> SparseMerkleTree<F, H, N> {
     /// Takes a batch of field elements, inserts
     /// these hashes into the tree, and updates the merkle root.
     pub fn insert_batch(&mut self, leaves: &BTreeMap<u32, F>, hasher: &H) -> Result<(), Error> {
         let last_level_index: u64 = (1u64 << N) - 1;
-
         let mut level_idxs: BTreeSet<u64> = BTreeSet::new();
         for (i, leaf) in leaves {
             let true_index = last_level_index + (*i as u64);
-            self.tree.insert(true_index, *leaf);
-            level_idxs.insert(parent(true_index).unwrap());
+            self.tree.insert(true_index, leaf.clone());
+            let idx = parent(true_index);
+            if let Some(idx) = idx {
+                level_idxs.insert(idx);
+            } else {
+                bail!("parent not found");
+            }
         }
 
         for level in 0..N {
             let mut new_idxs: BTreeSet<u64> = BTreeSet::new();
-            let empty_hash = self.empty_hashes[level];
+            let empty_hash = self.empty_hashes[level].clone();
             for i in level_idxs {
                 let left_index = left_child(i);
                 let right_index = right_child(i);
                 let left = self.tree.get(&left_index).unwrap_or(&empty_hash);
                 let right = self.tree.get(&right_index).unwrap_or(&empty_hash);
-                self.tree.insert(i, hasher.hash([*left, *right])?);
+                self.tree
+                    .insert(i, hasher.hash([left.clone(), right.clone()])?);
 
                 let parent = match parent(i) {
                     Some(i) => i,
@@ -186,11 +196,7 @@ impl<F: FieldExt + FromUniformBytes<64>, H: FieldHasher<F, 2>, const N: usize>
 
     /// Creates a new Sparse Merkle Tree from a map of indices to field
     /// elements.
-    pub fn new(
-        leaves: &BTreeMap<u32, F>,
-        hasher: &H,
-        empty_leaf: &[u8; 64],
-    ) -> Result<Self, Error> {
+    pub fn new(leaves: &BTreeMap<u32, F>, hasher: &H, empty_leaf: F) -> Result<Self, Error> {
         // Ensure the tree can hold this many leaves
         let last_level_size = leaves.len().next_power_of_two();
         let tree_size = 2 * last_level_size - 1;
@@ -212,11 +218,11 @@ impl<F: FieldExt + FromUniformBytes<64>, H: FieldHasher<F, 2>, const N: usize>
     }
 
     /// Creates a new Sparse Merkle Tree from an array of field elements.
-    pub fn new_sequential(leaves: &[F], hasher: &H, empty_leaf: &[u8; 64]) -> Result<Self, Error> {
+    pub fn new_sequential(leaves: &[F], hasher: &H, empty_leaf: F) -> Result<Self, Error> {
         let pairs: BTreeMap<u32, F> = leaves
             .iter()
             .enumerate()
-            .map(|(i, l)| (i as u32, *l))
+            .map(|(i, l)| (i as u32, l.clone()))
             .collect();
         let smt = Self::new(&pairs, hasher, empty_leaf)?;
 
@@ -228,14 +234,14 @@ impl<F: FieldExt + FromUniformBytes<64>, H: FieldHasher<F, 2>, const N: usize>
         self.tree
             .get(&0)
             .cloned()
-            .unwrap_or(*self.empty_hashes.last().unwrap())
+            .unwrap_or(self.empty_hashes.last().unwrap().clone())
     }
 
     /// Give the path leading from the leaf at `index` up to the root.  This is
     /// a "proof" in the sense of "valid path in a Merkle tree", not a ZK
     /// argument.
-    pub fn generate_membership_proof(&self, index: u64) -> Path<F, H, N> {
-        let mut path = [(F::ZERO, F::ZERO); N];
+    pub fn generate_membership_path(&self, index: u64) -> Path<F, N> {
+        let mut path = heapless::Vec::new();
 
         let tree_index = convert_index_to_last_level(index, N);
 
@@ -259,10 +265,128 @@ impl<F: FieldExt + FromUniformBytes<64>, H: FieldHasher<F, 2>, const N: usize>
             level += 1;
         }
 
-        Path {
-            path,
-            marker: PhantomData,
+        Path { path }
+    }
+
+    pub fn generate_membership_proof(&self, index: u64) -> Proof<F, N> {
+        let empty_hash = &self.empty_hashes[0];
+        let tree_index = convert_index_to_last_level(index, N);
+
+        Proof {
+            path: self.generate_membership_path(index),
+            root: self.root(),
+            leaf: self.tree.get(&tree_index).unwrap_or(empty_hash).to_owned(),
         }
+    }
+
+    /// Leaves as in leaf in index in the leaf vector
+    pub fn batch_prove(&self, leaves: &[u64]) -> PartialTree<F, N> {
+        let mut partial = PartialTree {
+            empty_hashes: self.empty_hashes.to_owned(),
+            root: self.root(),
+            ..Default::default()
+        };
+
+        for leaf in leaves {
+            partial.leaves.push(*leaf);
+
+            let tree_index = convert_index_to_last_level(*leaf, N);
+
+            // Iterate from the leaf up to the root, storing all intermediate hash values.
+            let mut current_node = tree_index;
+            let mut level = 0;
+
+            while !is_root(current_node) {
+                let sibling_node = sibling(current_node).unwrap();
+
+                let empty_hash = &self.empty_hashes[level];
+
+                let current = self.tree.get(&current_node).cloned().unwrap_or(*empty_hash);
+                let sibling = self.tree.get(&sibling_node).cloned().unwrap_or(*empty_hash);
+
+                if current != *empty_hash {
+                    partial.tree.insert(current_node, current);
+                }
+                if sibling != *empty_hash {
+                    partial.tree.insert(sibling_node, sibling);
+                }
+
+                current_node = parent(current_node).unwrap();
+                level += 1;
+            }
+        }
+
+        partial
+    }
+}
+
+// Partial tree
+// Turn Vec<Path> Into a partial tree. Verify tree.
+
+#[derive(Serialize, Deserialize, Default, Debug)]
+pub struct PartialTree<F: FieldExt, const N: usize> {
+    pub tree: BTreeMap<u64, F>,
+    empty_hashes: heapless::Vec<F, N>,
+    /// as in map index. not tree index
+    pub leaves: Vec<u64>,
+    pub root: F,
+}
+
+impl<F: FieldExt + Debug, const N: usize> PartialTree<F, N> {
+    pub fn verify<H: FieldHasher<F, 2>>(&self, hasher: &H) -> anyhow::Result<()> where {
+        #[cfg(not(feature = "notzk"))]
+        {
+            use risc0_zkvm::guest::env;
+            env::commit(&self.root);
+            env::commit(&self.leaves);
+            env::log("commited partial tree");
+        }
+
+        #[cfg(feature = "notzk")]
+        {
+            println!(
+                "Tree proof, total elements {}, leaves {}",
+                self.tree.len(),
+                self.leaves.len()
+            )
+        }
+        let last_level_index: u64 = (1u64 << N) - 1;
+        let mut level_idxs: BTreeSet<u64> = BTreeSet::new();
+        for i in &self.leaves {
+            let true_index = last_level_index + *i;
+            let idx = parent(true_index);
+            if let Some(idx) = idx {
+                level_idxs.insert(idx);
+            } else {
+                bail!("parent not found");
+            }
+        }
+
+        for level in 0..(N - 1) {
+            let mut new_idxs: BTreeSet<u64> = BTreeSet::new();
+            let empty_hash_parent = self.empty_hashes[level + 1].clone();
+            let empty_hash = self.empty_hashes[level].clone();
+            // Each layer is only calculated once
+            for i in level_idxs {
+                let left_index = left_child(i);
+                let right_index = right_child(i);
+                let left = self.tree.get(&left_index).unwrap_or(&empty_hash);
+                let right = self.tree.get(&right_index).unwrap_or(&empty_hash);
+
+                let got = *self.tree.get(&i).unwrap_or(&empty_hash_parent);
+                let expected = hasher.hash([left.clone(), right.clone()])?;
+                assert!(expected == got);
+
+                let parent = match parent(i) {
+                    Some(i) => i,
+                    None => break,
+                };
+                new_idxs.insert(parent);
+            }
+            level_idxs = new_idxs;
+        }
+
+        Ok(())
     }
 }
 
@@ -272,20 +396,18 @@ impl<F: FieldExt + FromUniformBytes<64>, H: FieldHasher<F, 2>, const N: usize>
 /// of the `default_leaf` hashed with itself and repeated `N` times
 /// with the intermediate results. These are used to initialize the
 /// sparse portion of the Sparse Merkle Tree.
-pub fn gen_empty_hashes<
-    F: FieldExt + FromUniformBytes<64>,
-    H: FieldHasher<F, 2>,
-    const N: usize,
->(
+pub fn gen_empty_hashes<F: FieldExt, H: FieldHasher<F, 2>, const N: usize>(
     hasher: &H,
-    default_leaf: &[u8; 64],
-) -> Result<[F; N], Error> {
-    let mut empty_hashes = [F::ZERO; N];
-    let mut empty_hash = F::from_uniform_bytes(default_leaf);
-    for item in empty_hashes.iter_mut().take(N) {
-        *item = empty_hash;
-        empty_hash = hasher.hash([empty_hash, empty_hash])?;
+    mut default_leaf: F,
+) -> Result<heapless::Vec<F, N>, Error> {
+    let mut empty_hashes = heapless::Vec::new();
+    let mut item;
+    for ix in 0..N {
+        item = default_leaf;
+        let _ = empty_hashes.push(item);
+        default_leaf = hasher.hash([default_leaf, default_leaf])?;
     }
+    assert!(empty_hashes.len() == N);
 
     Ok(empty_hashes)
 }
@@ -352,108 +474,51 @@ fn parent(index: u64) -> Option<u64> {
     }
 }
 
+use sha2::digest::Update;
+use sha2::Sha256;
+
+pub type BYTE32 = [u8; 32];
+
+impl FieldExt for [u8; 32] {}
+
+impl<const N: usize> FieldHasher<[u8; 32], N> for Sha256 {
+    fn hash(&self, nodes: [[u8; 32]; N]) -> Result<[u8; 32]> {
+        let mut h = Sha256::new();
+        for n in nodes {
+            Update::update(&mut h, &n);
+        }
+        let f = h.finalize().to_vec();
+        let mut s32 = [0; 32];
+        s32.copy_from_slice(&f);
+        Ok(s32)
+    }
+}
+
 #[cfg(test)]
 mod test {
-    use super::{gen_empty_hashes, SparseMerkleTree};
-    use crate::poseidon::{FieldHasher, Poseidon};
-    use ff::FromUniformBytes;
-    use halo2_proofs::arithmetic::Field as FieldExt;
-    use halo2_proofs::pasta::Fp;
+    use super::*;
     use rand::rngs::OsRng;
+    use sha2::Sha256;
     use std::collections::BTreeMap;
 
-    //helper to change leaves array to BTreeMap and then create SMT
-    fn create_merkle_tree<
-        F: FieldExt + FromUniformBytes<64>,
-        H: FieldHasher<F, 2>,
-        const N: usize,
-    >(
-        hasher: H,
-        leaves: &[F],
-        default_leaf: &[u8; 64],
-    ) -> SparseMerkleTree<F, H, N> {
-        let pairs: BTreeMap<u32, F> = leaves
-            .iter()
-            .enumerate()
-            .map(|(i, l)| (i as u32, *l))
-            .collect();
-
-        SparseMerkleTree::<F, H, N>::new(&pairs, &hasher, default_leaf).unwrap()
-    }
-
     #[test]
-    fn should_create_tree_poseidon() {
-        let poseidon = Poseidon::<Fp, 2>::new();
-        let default_leaf = [0u8; 64];
-        let rng = OsRng;
-        let leaves = [Fp::random(rng), Fp::random(rng), Fp::random(rng)];
-        const HEIGHT: usize = 3;
-        let smt = create_merkle_tree::<Fp, Poseidon<Fp, 2>, HEIGHT>(
-            poseidon.clone(),
-            &leaves,
-            &default_leaf,
-        );
+    fn merkleput() {
+        let mut leaves = vec![];
+        for n in 0..10 {
+            let mut s = [0; 32];
+            s[0] = n;
+            leaves.push(s);
+        }
+        let h = Sha256::new();
+        let mut tree: SparseMerkleTree<[u8; 32], Sha256, 32> =
+            SparseMerkleTree::new_sequential(&leaves, &h, [0; 32]).unwrap();
+        let mut l1 = [0; 32];
+        l1[0] = 222;
 
-        let root = smt.root();
-
-        let empty_hashes =
-            gen_empty_hashes::<Fp, Poseidon<Fp, 2>, HEIGHT>(&poseidon, &default_leaf).unwrap();
-        let hash1 = leaves[0];
-        let hash2 = leaves[1];
-        let hash3 = leaves[2];
-
-        let hash12 = poseidon.hash([hash1, hash2]).unwrap();
-        let hash34 = poseidon.hash([hash3, empty_hashes[0]]).unwrap();
-
-        let hash1234 = poseidon.hash([hash12, hash34]).unwrap();
-        let calc_root = poseidon.hash([hash1234, empty_hashes[2]]).unwrap();
-
-        assert_eq!(root, calc_root);
-    }
-
-    #[test]
-    fn should_generate_and_validate_proof_poseidon() {
-        let poseidon = Poseidon::<Fp, 2>::new();
-        let default_leaf = [0u8; 64];
-        let rng = OsRng;
-        let leaves = [Fp::random(rng), Fp::random(rng), Fp::random(rng)];
-        const HEIGHT: usize = 3;
-        let smt = create_merkle_tree::<Fp, Poseidon<Fp, 2>, HEIGHT>(
-            poseidon.clone(),
-            &leaves,
-            &default_leaf,
-        );
-
-        let proof = smt.generate_membership_proof(0);
-
-        let res = proof
-            .check_membership(&smt.root(), &leaves[0], &poseidon)
-            .unwrap();
-        assert!(res);
-    }
-
-    #[test]
-    fn should_find_the_index_poseidon() {
-        let poseidon = Poseidon::<Fp, 2>::new();
-        let default_leaf = [0u8; 64];
-        let rng = OsRng;
-        let leaves = [Fp::random(rng), Fp::random(rng), Fp::random(rng)];
-        const HEIGHT: usize = 3;
-        let smt = create_merkle_tree::<Fp, Poseidon<Fp, 2>, HEIGHT>(
-            poseidon.clone(),
-            &leaves,
-            &default_leaf,
-        );
-
-        let index = 2;
-
-        let proof = smt.generate_membership_proof(index);
-
-        let res = proof
-            .get_index(&smt.root(), &leaves[index as usize], &poseidon)
-            .unwrap();
-        let desired_res = Fp::from(index);
-
-        assert_eq!(res, desired_res);
+        let mut map = BTreeMap::new();
+        map.insert(2, l1);
+        let p = tree.insert_batch(&map, &h);
+        let p = tree.generate_membership_path(5);
+        dbg!(&p);
     }
 }
