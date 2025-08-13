@@ -11,8 +11,8 @@ risc0-zkvm = { version = "3.0.0-rc.1", default-features = false, features = [
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 serde = "1.0"
 tracing = "0.1.41"
-sparse_tree = { version = "0.1.0", path = "../sparse_tree" }
-sha2 = "=0.10.8"
+sparse_tree = { workspace = true }
+sha2 = { workspace = true }
 # getrandom = { version = "*", default-features = false, features = ["js"] }
 # halo2_proofs = { version = "0.3", default-features = false }
 

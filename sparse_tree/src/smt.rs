@@ -334,13 +334,12 @@ pub struct PartialTree<F: FieldExt, const N: usize> {
 
 impl<F: FieldExt + Debug, const N: usize> PartialTree<F, N> {
     pub fn verify<H: FieldHasher<F, 2>>(&self, hasher: &H) -> anyhow::Result<()> where {
-        #[cfg(not(feature = "notzk"))]
-        {
-            use risc0_zkvm::guest::env;
-            env::commit(&self.root);
-            env::commit(&self.leaves);
-            env::log("commited partial tree");
-        }
+        // #[cfg(not(feature = "notzk"))]
+        // {
+        //     use risc0_zkvm::guest::env;
+        //     env::commit(&self.root);
+        //     env::log("commited partial tree");
+        // }
 
         #[cfg(feature = "notzk")]
         {

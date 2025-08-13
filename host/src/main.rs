@@ -7,7 +7,7 @@ use risc0_zkvm::{default_prover, ExecutorEnv, Receipt};
 use sha2::{Digest, Sha256};
 use tracing::info;
 
-use sparse_tree::smt::SparseMerkleTree;
+use sparse_tree::{protocol::{ProofClaims, ProvingInput}, smt::SparseMerkleTree};
 
 fn main() -> Result<(), Box<dyn Error>> {
     tracing_subscriber::fmt()
@@ -24,7 +24,12 @@ fn main() -> Result<(), Box<dyn Error>> {
     let tree: SparseMerkleTree<[u8; 32], Sha256, 32> =
         SparseMerkleTree::new_sequential(&leaves, &h, [0; 32]).unwrap();
     let pt = tree.batch_prove(&[0, 2, 10]);
-    let env = ExecutorEnv::builder().write(&pt).unwrap().build()?;
+    let claim = ProofClaims { root: pt.root };
+    let input = ProvingInput {
+        pt,
+        claim
+    };
+    let env = ExecutorEnv::builder().write(&input).unwrap().build()?;
     let prover = default_prover();
 
     // Proof information by proving the specified ELF binary.
